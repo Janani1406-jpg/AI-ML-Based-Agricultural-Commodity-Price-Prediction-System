@@ -1,0 +1,125 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL Database ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: agri_db
+      POSTGRES_USER: agri_user
+      POSTGRES_PASSWORD: agri_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agri_user -d agri_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis Cache ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Backend API ───────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agri_user:agri_pass@postgres/agri_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-change-me-super-secret-key-min-32-chars}
+      MODEL_REGISTRY_PATH: /app/models
+      IMD_API_KEY: ${IMD_API_KEY:-}
+      DATA_GOV_API_KEY: ${DATA_GOV_API_KEY:-}
+    volumes:
+      - model_registry:/app/models
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Celery Worker (async tasks) ───────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    command: celery -A celery_app worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agri_user:agri_pass@postgres/agri_db
+      REDIS_URL: redis://redis:6379/0
+      MODEL_REGISTRY_PATH: /app/models
+    volumes:
+      - model_registry:/app/models
+      - ./backend:/app
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  # ── Celery Beat (scheduled tasks) ─────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    command: celery -A celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agri_user:agri_pass@postgres/agri_db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  # ── Frontend ──────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/frontend/Dockerfile
+      args:
+        REACT_APP_API_URL: http://localhost:8000/api
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  model_registry:
